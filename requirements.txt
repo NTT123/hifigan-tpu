@@ -1,0 +1,12 @@
+fire
+jax
+jaxlib
+librosa
+matplotlib
+numpy
+opax
+pax3
+pooch
+pytest
+tensorflow
+tqdm
