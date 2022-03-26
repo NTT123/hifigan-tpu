@@ -1,6 +1,7 @@
 """GPU training script"""
 import pickle
 import random
+import time
 from pathlib import Path
 
 import fire
@@ -198,6 +199,7 @@ def load_ckpt(ckpt_dir, nets, optims):
 def train(data_dir):
     """train model..."""
     generator, critics, mel_filter = create_model(CONFIG)
+    print(f"Data set size: {get_num_batch(data_dir, CONFIG.batch_size)} batches")
 
     def exp_decay(step):
         num_epoch = jnp.floor(step / get_num_batch(data_dir, CONFIG.batch_size))
@@ -216,21 +218,24 @@ def train(data_dir):
     optims = (optim_d, optim_g)
 
     Path(CONFIG.ckpt_dir).mkdir(exist_ok=True, parents=True)
-    step, net, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    start = time.perf_counter()
 
     for epoch in range(10000):
         for batch in load_data(data_dir, CONFIG):
             step += 1
-            nets, optims, (gen_loss, mel_loss, critic_loss) = update_fn(
-                nets, optims, batch
-            )
+            nets, optims, (g_loss, mel_loss, d_loss) = update_fn(nets, optims, batch)
 
-            if step % 100 == 0:
+            end = time.perf_counter()
+            dur = end - start
+            start = end
+            if step % 5 == 0:
                 print(
-                    f"step {step:07d}  epoch {epoch:05d}  gen loss {gen_loss:.3f}  mel loss {mel_loss:.3f}  critic loss {critic_loss:.3f}"
+                    f"step {step:07d}  epoch {epoch:05d}  gen loss {g_loss:.3f}"
+                    f"  mel loss {mel_loss:.3f}  critic loss {d_loss:.3f}  {dur:.2f}s"
                 )
 
-        if epoch % 20 == 0:
+        if epoch % 10 == 0:
             save_ckpt(CONFIG.ckpt_dir, step, nets, optims)
 
 
