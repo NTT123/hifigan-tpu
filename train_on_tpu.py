@@ -117,6 +117,9 @@ def one_update_step(nets_optims, inputs):
     """update nets"""
     nets, optims = nets_optims
     generator, critics, mel_filter = nets
+    cond, y = inputs
+    mel = mel_filter(y)
+    inputs = cond, y, mel
     optim_d, optim_g = optims
     vag = pax.value_and_grad(loss_fn, has_aux=True)
     (
@@ -134,7 +137,9 @@ def one_update_step(nets_optims, inputs):
 
 
 def update_fn(nets, optims, inputs):
-    (nets, optims), losses = one_update_step((nets, optims), inputs)
+    inputs = jax.tree_map(lambda x: x.astype(jnp.float32), inputs)
+    (nets, optims), losses = pax.scan(one_update_step, (nets, optims), inputs, unroll=1)
+    losses = jax.tree_map(lambda x: x[-1], losses)
     return nets, optims, losses
 
 
@@ -166,17 +171,22 @@ def double_buffer(ds, devices):
         yield batch
 
 
-def load_data(data_dir, config, devices):
+def load_data(data_dir, config, devices, spu):
     """return data iter"""
     files = sorted(Path(data_dir).glob("*.npz"))
     assert len(files) > 0, "Empty data directory"
     batch = []
+    cache = {}
     while True:
         random.shuffle(files)
         num_devices = len(devices)
         for f in files:
-            dic = np.load(f)
-            mel, y = dic["mel"], dic["y"]
+            if f in cache:
+                mel, y = cache[f]
+            else:
+                dic = np.load(f)
+                mel, y = dic["mel"], dic["y"]
+                cache[f] = mel, y
             num_frame = config.segment_size // config.hop_size
             start_frame = random.randint(0, mel.shape[0] - 1 - num_frame)
             end_frame = start_frame + num_frame
@@ -185,13 +195,13 @@ def load_data(data_dir, config, devices):
             end_idx = start_idx + config.segment_size
             y = y[start_idx:end_idx]
             batch.append((mel, y))
-            if len(batch) == config.batch_size:
+            if len(batch) == config.batch_size * spu:
                 mel, y = zip(*batch)
-                mel = np.array(mel).astype(np.float32)
-                y = np.array(y)
-                mel = mel.reshape((num_devices, -1, *mel.shape[1:]))
-                y = y.reshape((num_devices, -1, *y.shape[1:]))
-                yield mel, y, mel
+                mel = np.array(mel).astype(np.float16)
+                y = np.array(y).astype(np.float16)
+                mel = mel.reshape((num_devices, spu, -1, *mel.shape[1:]))
+                y = y.reshape((num_devices, spu, -1, *y.shape[1:]))
+                yield mel, y
                 batch = []
 
 
@@ -232,8 +242,13 @@ def load_ckpt(ckpt_dir, nets, optims):
     return step, nets, optims
 
 
-def train(data_dir):
-    """train model..."""
+def train(data_dir, spu=40):
+    """train model...
+    
+    Arguments:
+        data_dir: path to data directory
+        spu: number of update steps per pmap update call
+    """
 
     # TPU setup
     if "COLAB_TPU_ADDR" in os.environ:
@@ -268,8 +283,8 @@ def train(data_dir):
     start = time.perf_counter()
     pmap_update_fn = jax.pmap(update_fn, axis_name="i", devices=devices)
 
-    for batch in double_buffer(load_data(data_dir, CONFIG, devices), devices):
-        step += 1
+    for batch in double_buffer(load_data(data_dir, CONFIG, devices, spu), devices):
+        step += spu
         nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
         if step % 50 == 0:
