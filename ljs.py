@@ -1,5 +1,5 @@
 """
-Preprocess LJSpeech dataset
+Download LJSpeech dataset
 """
 
 from pathlib import Path
@@ -26,4 +26,4 @@ def download_ljs_dataset():
 
 data_dir = download_ljs_dataset()
 wav_dir = data_dir / "wavs"
-print(f"Downloaded data is located at {wav_dir}.")
+print(f"Downloaded data is located at {wav_dir}")

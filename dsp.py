@@ -50,9 +50,8 @@ def batched_stft(
         fft_window = jnp.pad(fft_window, (pad_len, pad_len), mode="constant")
         win_length = n_fft
 
-    # center padding
     p = (n_fft - hop_length) // 2
-    y = jnp.pad(y, [(p, p), (0, 0)], mode="constant")
+    y = jnp.pad(y, [(p, p), (0, 0)], mode="reflect")
 
     # jax does not support ``np.lib.stride_tricks.as_strided`` function
     # see https://github.com/google/jax/issues/3171 for comments.

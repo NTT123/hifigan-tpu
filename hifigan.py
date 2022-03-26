@@ -10,6 +10,9 @@ import pax
 LRELU_SLOPE = 0.1
 
 
+# Source: https://github.com/deepmind/dm-haiku/blob/main/haiku/_src/spectral_norm.py
+# Copyright 2019 DeepMind Technologies Limited. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0
 def _l2_normalize(x, axis=None, eps=1e-12):
     """Normalizes along dimension `axis` using an L2 norm.
     This specialized function exists for numerical stability reasons.
@@ -26,7 +29,7 @@ def _l2_normalize(x, axis=None, eps=1e-12):
 
 
 class WeightNormConv(pax.Module):
-    """Weight norm conv module"""
+    """Weight norm normalized convolution"""
 
     def __init__(self, conv: pax.Conv1D):
         super().__init__()
@@ -65,7 +68,7 @@ class WeightNormConv(pax.Module):
 
 
 class SpectralNormConv(pax.Module):
-    """SNC"""
+    """Spectral norm normalized convolution"""
 
     def __init__(
         self,
@@ -83,6 +86,9 @@ class SpectralNormConv(pax.Module):
     def get_weight(self):
         """get normalized weight"""
         weight = self.conv.weight
+
+        # Copyright 2019 DeepMind Technologies Limited. All Rights Reserved.
+        # Licensed under the Apache License, Version 2.0
         value = jnp.reshape(weight, [-1, weight.shape[-1]])
         if self.training:
             u0 = self.u0
@@ -110,7 +116,7 @@ class SpectralNormConv(pax.Module):
         return self.conv.replace(weight=self.get_weight())(x)
 
 
-def conv(
+def normalized_conv(
     input,
     output,
     kernel_size,
@@ -120,8 +126,8 @@ def conv(
     group=1,
     spectral_norm=False,
 ):
-    """return a conv"""
-    conv = pax.Conv1D(
+    """return a 'normalized' conv"""
+    mod = pax.Conv1D(
         input,
         output,
         kernel_size,
@@ -133,9 +139,9 @@ def conv(
     )
 
     if spectral_norm:
-        return SpectralNormConv(conv)
+        return SpectralNormConv(mod)
 
-    return WeightNormConv(conv)
+    return WeightNormConv(mod)
 
 
 def conv_transpose(in_channel, out_channel, kernel_size, upsample_factor):
@@ -158,14 +164,14 @@ class ResBlock1(pax.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super().__init__()
         self.convs1 = [
-            conv(channels, channels, kernel_size, 1, dilation[0]),
-            conv(channels, channels, kernel_size, 1, dilation[1]),
-            conv(channels, channels, kernel_size, 1, dilation[2]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[0]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[1]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[2]),
         ]
         self.convs2 = [
-            conv(channels, channels, kernel_size, 1, 1),
-            conv(channels, channels, kernel_size, 1, 1),
-            conv(channels, channels, kernel_size, 1, 1),
+            normalized_conv(channels, channels, kernel_size, 1, 1),
+            normalized_conv(channels, channels, kernel_size, 1, 1),
+            normalized_conv(channels, channels, kernel_size, 1, 1),
         ]
 
     def __call__(self, x):
@@ -184,8 +190,8 @@ class ResBlock2(pax.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
         super().__init__()
         self.convs = [
-            conv(channels, channels, kernel_size, 1, dilation[0]),
-            conv(channels, channels, kernel_size, 1, dilation[1]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[0]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[1]),
         ]
 
     def __call__(self, x):
@@ -197,7 +203,7 @@ class ResBlock2(pax.Module):
 
 
 class Generator(pax.Module):
-    """Generator"""
+    """HiFi-GAN Generator"""
 
     def __init__(
         self,
@@ -212,8 +218,9 @@ class Generator(pax.Module):
         super().__init__()
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-        self.conv_pre = conv(mel_dim, upsample_initial_channel, 7, 1, 1)
+        self.conv_pre = normalized_conv(mel_dim, upsample_initial_channel, 7, 1, 1)
         create_resblock = ResBlock1 if resblock_kind == "1" else ResBlock2
+
         self.ups = []
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             in_channel = upsample_initial_channel // (2**i)
@@ -225,7 +232,7 @@ class Generator(pax.Module):
             for (k, d) in zip(resblock_kernel_sizes, resblock_dilation_sizes):
                 self.resblocks.append(create_resblock(ch, k, d))
 
-        self.conv_post = conv(ch, 1, 7, 1, 1)
+        self.conv_post = normalized_conv(ch, 1, 7, 1, 1)
 
     def __call__(self, x):
         x = self.conv_pre(x)
@@ -240,6 +247,8 @@ class Generator(pax.Module):
                     xs += self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
 
+        # 0.01 is pytorch leaky value slope,
+        # this is not needed as jax uses the same value.
         x = jax.nn.leaky_relu(x, 0.01)
         x = self.conv_post(x)
         x = jnp.tanh(x)
@@ -248,19 +257,19 @@ class Generator(pax.Module):
 
 
 class CriticP(pax.Module):
-    """CriticP"""
+    """HiFi-GAN CriticP"""
 
     def __init__(self, period, kernel_size=5, stride=3):
         super().__init__()
         self.period = period
         self.convs = [
-            conv(1, 32, kernel_size, stride),
-            conv(32, 128, kernel_size, stride),
-            conv(128, 512, kernel_size, stride),
-            conv(512, 1024, kernel_size, stride),
-            conv(1024, 1024, kernel_size, stride, padding=[(2, 2)]),
+            normalized_conv(1, 32, kernel_size, stride),
+            normalized_conv(32, 128, kernel_size, stride),
+            normalized_conv(128, 512, kernel_size, stride),
+            normalized_conv(512, 1024, kernel_size, stride),
+            normalized_conv(1024, 1024, kernel_size, stride),
         ]
-        self.conv_post = conv(1024, 1, 3, 1, 1)
+        self.conv_post = normalized_conv(1024, 1, 3, 1, 1)
 
     def __call__(self, x: jnp.ndarray):
         fmap = []
@@ -274,8 +283,8 @@ class CriticP(pax.Module):
         x = jnp.swapaxes(x, 1, 2)
         x = jnp.reshape(x, (b * self.period, t // self.period, c))
 
-        for l in self.convs:
-            x = l(x)
+        for conv in self.convs:
+            x = conv(x)
             x = jax.nn.leaky_relu(x, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
@@ -285,7 +294,7 @@ class CriticP(pax.Module):
 
 
 class MultiPeriodCritic(pax.Module):
-    """MPC"""
+    """Multi Period Critic"""
 
     def __init__(self):
         super().__init__()
@@ -308,20 +317,20 @@ class MultiPeriodCritic(pax.Module):
 
 
 class CriticS(pax.Module):
-    """CS"""
+    """Scale Critic"""
 
-    def __init__(self, use_spectral_norm=False):
+    def __init__(self, spectral_norm=False):
         super().__init__()
         self.convs = [
-            conv(1, 128, 15, 1, spectral_norm=use_spectral_norm),
-            conv(128, 128, 41, 2, group=4, spectral_norm=use_spectral_norm),
-            conv(128, 256, 41, 2, group=16, spectral_norm=use_spectral_norm),
-            conv(256, 512, 41, 4, group=16, spectral_norm=use_spectral_norm),
-            conv(512, 1024, 41, 4, group=16, spectral_norm=use_spectral_norm),
-            conv(1024, 1024, 41, 1, group=16, spectral_norm=use_spectral_norm),
-            conv(1024, 1024, 5, 1, spectral_norm=use_spectral_norm),
+            normalized_conv(1, 128, 15, 1, spectral_norm=spectral_norm),
+            normalized_conv(128, 128, 41, 2, group=4, spectral_norm=spectral_norm),
+            normalized_conv(128, 256, 41, 2, group=16, spectral_norm=spectral_norm),
+            normalized_conv(256, 512, 41, 4, group=16, spectral_norm=spectral_norm),
+            normalized_conv(512, 1024, 41, 4, group=16, spectral_norm=spectral_norm),
+            normalized_conv(1024, 1024, 41, 1, group=16, spectral_norm=spectral_norm),
+            normalized_conv(1024, 1024, 5, 1, spectral_norm=spectral_norm),
         ]
-        self.conv_post = conv(1024, 1, 3, 1, spectral_norm=use_spectral_norm)
+        self.conv_post = normalized_conv(1024, 1, 3, 1, spectral_norm=spectral_norm)
 
     def __call__(self, x):
         fmap = []
@@ -337,12 +346,12 @@ class CriticS(pax.Module):
 
 
 class MultiScaleCritic(pax.Module):
-    """MSC"""
+    """Multi Scale Critic"""
 
     def __init__(self):
         super().__init__()
         self.critics = [
-            CriticS(use_spectral_norm=True),
+            CriticS(spectral_norm=True),
             CriticS(),
             CriticS(),
         ]

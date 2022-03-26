@@ -1,6 +1,6 @@
-### config v1
+version = "v2"
 resblock_kind = "1"
-batch_size = 16
+batch_size = 32
 learning_rate = 0.0002
 adam_b1 = 0.8
 adam_b2 = 0.99
@@ -20,4 +20,10 @@ sample_rate = 22050
 fmin = 0
 fmax = 8000
 fmax_for_loss = None
-wav_dir = "data"
+ckpt_dir = "ckpts"
+
+if version == "v1":
+    upsample_initial_channel = 512
+elif version == "v2":
+    batch_size = 64
+    upsample_initial_channel = 128
