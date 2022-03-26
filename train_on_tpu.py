@@ -1,4 +1,5 @@
-"""GPU training script"""
+"""TPU training script"""
+import os
 import pickle
 import random
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 import fire
 import jax
 import jax.numpy as jnp
+import jax.tools.colab_tpu
 import numpy as np
 import opax
 import pax
@@ -78,6 +80,7 @@ def update_critic(nets, optims, inputs):
     (loss_disc_all, nets), grads = pax.value_and_grad(critic_loss_fn, has_aux=True)(
         nets, inputs
     )
+    grads = jax.lax.pmean(grads, axis_name="i")
     nets, optims = opax.apply_gradients(nets, optims, grads)
     return nets, optims, loss_disc_all
 
@@ -110,9 +113,9 @@ def loss_fn(generator, inputs):
     return loss_gen_all, (generator, critics, optim_d, (loss_mel, loss_disc_all))
 
 
-@jax.jit
-def update_fn(nets, optims, inputs):
+def one_update_step(nets_optims, inputs):
     """update nets"""
+    nets, optims = nets_optims
     generator, critics, mel_filter = nets
     optim_d, optim_g = optims
     vag = pax.value_and_grad(loss_fn, has_aux=True)
@@ -121,12 +124,18 @@ def update_fn(nets, optims, inputs):
         (generator, critics, optim_d, (loss_mel, loss_disc_all)),
     ), grads = vag(generator, (inputs, critics, optim_d, mel_filter))
 
+    grads = jax.lax.pmean(grads, axis_name="i")
+
     generator, optim_g = opax.apply_gradients(generator, optim_g, grads)
-    return (
-        (generator, critics, mel_filter),
-        (optim_d, optim_g),
-        (loss_gen_all, loss_mel, loss_disc_all),
-    )
+    nets = (generator, critics, mel_filter)
+    optims = (optim_d, optim_g)
+    losses = (loss_gen_all, loss_mel, loss_disc_all)
+    return (nets, optims), losses
+
+
+def update_fn(nets, optims, inputs):
+    (nets, optims), losses = one_update_step((nets, optims), inputs)
+    return nets, optims, losses
 
 
 def get_num_batch(data_dir, batch_size):
@@ -134,35 +143,62 @@ def get_num_batch(data_dir, batch_size):
     return len(files) // batch_size
 
 
-def load_data(data_dir, config):
+def _device_put_sharded(sharded_tree, devices):
+    leaves, treedef = jax.tree_flatten(sharded_tree)
+    n = leaves[0].shape[0]
+    return jax.device_put_sharded(
+        [jax.tree_unflatten(treedef, [l[i] for l in leaves]) for i in range(n)], devices
+    )
+
+
+def double_buffer(ds, devices):
+    """
+    create a double buffer iterator
+    """
+    batch = None
+    for next_batch in ds:
+        assert next_batch is not None
+        next_batch = _device_put_sharded(next_batch, devices)
+        if batch is not None:
+            yield batch
+        batch = next_batch
+    if batch is not None:
+        yield batch
+
+
+def load_data(data_dir, config, devices):
     """return data iter"""
     files = sorted(Path(data_dir).glob("*.npz"))
     assert len(files) > 0, "Empty data directory"
     batch = []
-    random.shuffle(files)
-    for f in files:
-        dic = np.load(f)
-        mel, y = dic["mel"], dic["y"]
-        num_frame = config.segment_size // config.hop_size
-        start_frame = random.randint(0, mel.shape[0] - 1 - num_frame)
-        end_frame = start_frame + num_frame
-        mel = mel[start_frame:end_frame]
-        start_idx = start_frame * config.hop_size
-        end_idx = start_idx + config.segment_size
-        y = y[start_idx:end_idx]
-        batch.append((mel, y))
-        if len(batch) == config.batch_size:
-            mel, y = zip(*batch)
-            mel = np.array(mel).astype(np.float32)
-            y = np.array(y)
-            yield mel, y, mel
-            batch = []
+    while True:
+        random.shuffle(files)
+        num_devices = len(devices)
+        for f in files:
+            dic = np.load(f)
+            mel, y = dic["mel"], dic["y"]
+            num_frame = config.segment_size // config.hop_size
+            start_frame = random.randint(0, mel.shape[0] - 1 - num_frame)
+            end_frame = start_frame + num_frame
+            mel = mel[start_frame:end_frame]
+            start_idx = start_frame * config.hop_size
+            end_idx = start_idx + config.segment_size
+            y = y[start_idx:end_idx]
+            batch.append((mel, y))
+            if len(batch) == config.batch_size:
+                mel, y = zip(*batch)
+                mel = np.array(mel).astype(np.float32)
+                y = np.array(y)
+                mel = mel.reshape((num_devices, -1, *mel.shape[1:]))
+                y = y.reshape((num_devices, -1, *y.shape[1:]))
+                yield mel, y, mel
+                batch = []
 
 
 def save_ckpt(ckpt_dir, step, nets, optims):
     """save checkpoint to disk"""
-    (generator, critics, mel_filter) = jax.device_get(nets)
-    (optim_d, optim_g) = jax.device_get(optims)
+    (generator, critics, _) = nets
+    (optim_d, optim_g) = optims
     dic = {
         "step": step,
         "generator": generator.state_dict(),
@@ -172,7 +208,7 @@ def save_ckpt(ckpt_dir, step, nets, optims):
     }
     file = ckpt_dir / f"hifigan_{step:07d}.ckpt"
     with open(file, "wb") as f:
-        pickle.dump(f, dic)
+        pickle.dump(dic, f)
 
 
 def load_ckpt(ckpt_dir, nets, optims):
@@ -198,8 +234,17 @@ def load_ckpt(ckpt_dir, nets, optims):
 
 def train(data_dir):
     """train model..."""
+
+    # TPU setup
+    if "COLAB_TPU_ADDR" in os.environ:
+        jax.tools.colab_tpu.setup_tpu()
+
     generator, critics, mel_filter = create_model(CONFIG)
-    print(f"Data set size: {get_num_batch(data_dir, CONFIG.batch_size)} batches")
+    num_batch = get_num_batch(data_dir, CONFIG.batch_size)
+    print(f"Data set size: {num_batch} batches")
+    num_devices = jax.device_count()
+    devices = jax.devices()
+    print(f"{num_devices} devices: {devices}")
 
     def exp_decay(step):
         num_epoch = jnp.floor(step / 1000)
@@ -219,24 +264,30 @@ def train(data_dir):
 
     Path(CONFIG.ckpt_dir).mkdir(exist_ok=True, parents=True)
     step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    nets, optims = jax.device_put_replicated((nets, optims), devices)
     start = time.perf_counter()
+    pmap_update_fn = jax.pmap(update_fn, axis_name="i", devices=devices)
 
-    for epoch in range(10000):
-        for batch in load_data(data_dir, CONFIG):
-            step += 1
-            nets, optims, (g_loss, mel_loss, d_loss) = update_fn(nets, optims, batch)
+    for batch in double_buffer(load_data(data_dir, CONFIG, devices), devices):
+        step += 1
+        nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
+        if step % 50 == 0:
             end = time.perf_counter()
             dur = end - start
             start = end
-            if step % 5 == 0:
-                print(
-                    f"step {step:07d}  epoch {epoch:05d}  gen loss {g_loss:.3f}"
-                    f"  mel loss {mel_loss:.3f}  critic loss {d_loss:.3f}  {dur:.2f}s"
-                )
+            epoch = step // num_batch
+            lr = optims[0][-1].learning_rate[0]
+            print(
+                f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss[0]:.3f}"
+                f"  mel loss {mel_loss[0]:.3f}  critic loss {d_loss[0]:.3f}  {dur:.2f}s"
+            )
 
-        if epoch % 10 == 0:
-            save_ckpt(Path(CONFIG.ckpt_dir), step, nets, optims)
+        if step % 10_000 == 0:
+            nets_, optims_ = jax.device_get(
+                jax.tree_map(lambda x: x[0], (nets, optims))
+            )
+            save_ckpt(Path(CONFIG.ckpt_dir), step, nets_, optims_)
 
 
 if __name__ == "__main__":
