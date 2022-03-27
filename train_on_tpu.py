@@ -1,4 +1,5 @@
 """TPU training script"""
+import datetime
 import os
 import pickle
 import random
@@ -12,6 +13,7 @@ import jax.tools.colab_tpu
 import numpy as np
 import opax
 import pax
+import tensorflow as tf
 
 import config as CONFIG
 from dsp import MelFilter
@@ -137,8 +139,9 @@ def one_update_step(nets_optims, inputs):
 
 
 def update_fn(nets, optims, inputs):
+    """update fn"""
     inputs = jax.tree_map(lambda x: x.astype(jnp.float32), inputs)
-    (nets, optims), losses = pax.scan(one_update_step, (nets, optims), inputs, unroll=1)
+    (nets, optims), losses = pax.scan(one_update_step, (nets, optims), inputs)
     losses = jax.tree_map(lambda x: x[-1], losses)
     return nets, optims, losses
 
@@ -171,10 +174,20 @@ def double_buffer(ds, devices):
         yield batch
 
 
-def load_data(data_dir, config, devices, spu):
-    """return data iter"""
+def load_npz_files(data_dir, test_size=10, split="train"):
+    """return list of npz file in a directory"""
     files = sorted(Path(data_dir).glob("*.npz"))
     assert len(files) > 0, "Empty data directory"
+    assert len(files) > test_size, "Empty test data size"
+    if split == train:
+        return files[test_size:]
+    else:
+        return files[:test_size]
+
+
+def load_data(data_dir, config, devices, spu):
+    """return data iter"""
+    files = load_npz_files(data_dir, split="train")
     batch = []
     cache = {}
     while True:
@@ -242,13 +255,16 @@ def load_ckpt(ckpt_dir, nets, optims):
     return step, nets, optims
 
 
-def train(data_dir, spu=40):
+def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
     """train model...
-    
+
     Arguments:
         data_dir: path to data directory
         spu: number of update steps per pmap update call
     """
+
+    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    summary_writer = tf.summary.create_file_writer(str(Path(log_dir) / current_time))
 
     # TPU setup
     if "COLAB_TPU_ADDR" in os.environ:
@@ -278,13 +294,19 @@ def train(data_dir, spu=40):
     optims = (optim_d, optim_g)
 
     Path(CONFIG.ckpt_dir).mkdir(exist_ok=True, parents=True)
-    step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    last_step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
     nets, optims = jax.device_put_replicated((nets, optims), devices)
     start = time.perf_counter()
     pmap_update_fn = jax.pmap(update_fn, axis_name="i", devices=devices)
+    test_files = load_npz_files(data_dir, split="test")
+    step = 0 if last_step == -1 else (last_step + spu)
+    # log all ground-truth test audio clips
+    with summary_writer.as_default(step=step):
+        for f in test_files:
+            dic = np.load(f)
+            tf.summary.audio(f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate)
 
     for batch in double_buffer(load_data(data_dir, CONFIG, devices, spu), devices):
-        step += spu
         nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
         if step % 50 == 0:
@@ -298,11 +320,35 @@ def train(data_dir, spu=40):
                 f"  mel loss {mel_loss[0]:.3f}  critic loss {d_loss[0]:.3f}  {dur:.2f}s"
             )
 
+            with summary_writer.as_default(step=step):
+                tf.summary.scalar("step", step)
+                tf.summary.scalar("epoch", epoch)
+                tf.summary.scalar("lr", lr)
+                tf.summary.scalar("gen_loss", g_loss[0])
+                tf.summary.scalar("mel_loss", mel_loss[0])
+                tf.summary.scalar("critic_loss", d_loss[0])
+                tf.summary.scalar("duration", dur)
+
+        if step % 1000 == 0:
+            with summary_writer.as_default(step=step):
+                g = jax.tree_map(lambda x: x[0], nets[0].eval())
+                g = jax.device_put(g, device=jax.devices("cpu")[0])
+                for path in test_files:
+                    dic = np.load(path)
+                    yhat = g(dic["mel"][None].astype(jnp.float32))
+                    tf.summary.audio(
+                        f"gen/{path.stem}",
+                        yhat[:, :, None],
+                        CONFIG.sample_rate,
+                    )
+
         if step % 10_000 == 0:
             nets_, optims_ = jax.device_get(
                 jax.tree_map(lambda x: x[0], (nets, optims))
             )
             save_ckpt(Path(CONFIG.ckpt_dir), step, nets_, optims_)
+
+        step += spu
 
 
 if __name__ == "__main__":
