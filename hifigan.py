@@ -222,9 +222,12 @@ class Generator(pax.Module):
         self.mel_dim = mel_dim
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-        self.conv_pre = normalized_conv(
-            mel_dim, upsample_initial_channel, 7, 1, 1, "VALID"
-        )
+        uic = upsample_initial_channel
+        self.conv_pre = normalized_conv(mel_dim, uic, 1, 1, 1, "VALID")
+        self.dilated_convs = [
+            normalized_conv(uic, uic, 3, 1, 2**i, "VALID") for i in range(5)
+        ]
+
         create_resblock = ResBlock1 if resblock_kind == "1" else ResBlock2
 
         self.ups = []
@@ -272,6 +275,13 @@ class Generator(pax.Module):
 
     def __call__(self, x, remove_output_padding=True):
         x = self.conv_pre(x)
+
+        for conv in self.dilated_convs:
+            xt = jax.nn.leaky_relu(x, LRELU_SLOPE)
+            xt = conv(xt)
+            p = (x.shape[1] - xt.shape[1]) // 2
+            x = x[:, p:-p, :] + xt
+
         for i in range(self.num_upsamples):
             x = jax.nn.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
@@ -455,3 +465,18 @@ def generator_loss(disc_outputs):
         loss += l
 
     return loss, gen_losses
+
+
+if __name__ == "__main__":
+    import config
+
+    g = Generator(
+        config.num_mels,
+        config.resblock_kernel_sizes,
+        config.upsample_rates,
+        config.upsample_kernel_sizes,
+        config.upsample_initial_channel,
+        config.resblock_kind,
+        config.resblock_dilation_sizes,
+    )
+    print(g.compute_padding_values())

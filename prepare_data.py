@@ -31,11 +31,13 @@ mel_fn = jax.jit(lambda x: mel_filter(x[None])[0].astype(jnp.float16))
 
 # save mel to disk
 wav_files = sorted(args.wav_dir.glob("*.wav"), key=os.path.getsize)
-L = len(librosa.load(wav_files[-1], sr=None)[0])
+L = len(librosa.load(wav_files[-1], sr=CONFIG.sample_rate, res_type="soxr_hq")[0])
 random.Random(42).shuffle(wav_files)
 data = []
 for path in tqdm(wav_files):
-    y, sr = librosa.load(path, sr=None)
+    y, sr = librosa.load(path, sr=CONFIG.sample_rate, res_type="soxr_hq")
+    y = y / max(1.0, np.max(np.abs(y)))  # rescale to avoid overflow
+
     l = len(y)
     y = np.pad(y, (0, L - len(y)))
     mel = mel_fn(jax.device_put(y))

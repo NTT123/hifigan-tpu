@@ -8,5 +8,6 @@ opax
 pax3
 pooch
 pytest
+soxr
 tensorflow
 tqdm
