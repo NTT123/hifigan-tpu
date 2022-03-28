@@ -5,6 +5,7 @@ HiFi-GAN model: generator and critics.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pax
 
 LRELU_SLOPE = 0.1
@@ -152,7 +153,7 @@ def conv_transpose(in_channel, out_channel, kernel_size, upsample_factor):
             out_channel,
             kernel_size,
             upsample_factor,
-            padding="SAME",
+            padding="VALID",
             w_init=jax.nn.initializers.normal(0.01),
         )
     )
@@ -164,14 +165,14 @@ class ResBlock1(pax.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super().__init__()
         self.convs1 = [
-            normalized_conv(channels, channels, kernel_size, 1, dilation[0]),
-            normalized_conv(channels, channels, kernel_size, 1, dilation[1]),
-            normalized_conv(channels, channels, kernel_size, 1, dilation[2]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[0], "VALID"),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[1], "VALID"),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[2], "VALID"),
         ]
         self.convs2 = [
-            normalized_conv(channels, channels, kernel_size, 1, 1),
-            normalized_conv(channels, channels, kernel_size, 1, 1),
-            normalized_conv(channels, channels, kernel_size, 1, 1),
+            normalized_conv(channels, channels, kernel_size, 1, 1, "VALID"),
+            normalized_conv(channels, channels, kernel_size, 1, 1, "VALID"),
+            normalized_conv(channels, channels, kernel_size, 1, 1, "VALID"),
         ]
 
     def __call__(self, x):
@@ -180,7 +181,8 @@ class ResBlock1(pax.Module):
             xt = c1(xt)
             xt = jax.nn.leaky_relu(xt, LRELU_SLOPE)
             xt = c2(xt)
-            x = xt + x
+            p = (x.shape[1] - xt.shape[1]) // 2
+            x = xt + x[:, p:-p, :]
         return x
 
 
@@ -190,15 +192,16 @@ class ResBlock2(pax.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
         super().__init__()
         self.convs = [
-            normalized_conv(channels, channels, kernel_size, 1, dilation[0]),
-            normalized_conv(channels, channels, kernel_size, 1, dilation[1]),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[0], "VALID"),
+            normalized_conv(channels, channels, kernel_size, 1, dilation[1], "VALID"),
         ]
 
     def __call__(self, x):
         for c in self.convs:
             xt = jax.nn.leaky_relu(x, LRELU_SLOPE)
             xt = c(xt)
-            x = xt + x
+            p = (x.shape[1] - xt.shape[1]) // 2
+            x = xt + x[:, p:-p, :]
         return x
 
 
@@ -216,15 +219,23 @@ class Generator(pax.Module):
         resblock_dilation_sizes,
     ):
         super().__init__()
+        self.mel_dim = mel_dim
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-        self.conv_pre = normalized_conv(mel_dim, upsample_initial_channel, 7, 1, 1)
+        self.conv_pre = normalized_conv(
+            mel_dim, upsample_initial_channel, 7, 1, 1, "VALID"
+        )
         create_resblock = ResBlock1 if resblock_kind == "1" else ResBlock2
 
         self.ups = []
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             in_channel = upsample_initial_channel // (2**i)
-            self.ups.append(conv_transpose(in_channel, in_channel // 2, k, u))
+            self.ups.append(
+                pax.Sequential(
+                    conv_transpose(in_channel, in_channel // 2, k, u),
+                    lambda x: x[:, u:-u, :],
+                )
+            )
 
         self.resblocks = []
         for i in range(len(self.ups)):
@@ -232,9 +243,34 @@ class Generator(pax.Module):
             for (k, d) in zip(resblock_kernel_sizes, resblock_dilation_sizes):
                 self.resblocks.append(create_resblock(ch, k, d))
 
-        self.conv_post = normalized_conv(ch, 1, 7, 1, 1)
+        self.conv_post = normalized_conv(ch, 1, 7, 1, 1, "VALID")
 
-    def __call__(self, x):
+    def compute_padding_values(self, num_frame=1024):
+        """Compute the input padding and output padding of the network.
+
+        Usage:
+        >>> net = Generator(...)
+        >>> input_pad, output_pad = net.compute_padding_values()
+        >>> x = jnp.pad(x, [(0, 0), (input_pad, input_pad), (0, 0)], mode="reflect")
+        >>> y = net(x)
+        >>> y = y[:, output_pad:-output_pad]
+        """
+        assert num_frame % 2 == 0
+        mel = np.empty((1, num_frame + 1, self.mel_dim))
+        fn = lambda g, c: g(c, remove_output_padding=False)
+        y1 = jax.eval_shape(fn, self.eval(), mel)
+        y2 = jax.eval_shape(fn, self.eval(), mel[:, :-1, :])
+        # each frame generates "hop" values
+        hop = y1.shape[1] - y2.shape[1]
+        # compute the minimum even number of frames
+        min_frame = num_frame - y2.shape[1] // hop // 2 * 2
+        y3 = jax.eval_shape(fn, self.eval(), mel[:, :min_frame, :])
+        # we need to remove the "output" of padding frames
+        remain = y3.shape[1]
+        assert remain % 2 == 0
+        return min_frame // 2, remain // 2
+
+    def __call__(self, x, remove_output_padding=True):
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = jax.nn.leaky_relu(x, LRELU_SLOPE)
@@ -244,7 +280,9 @@ class Generator(pax.Module):
                 if xs is None:
                     xs = self.resblocks[i * self.num_kernels + j](x)
                 else:
-                    xs += self.resblocks[i * self.num_kernels + j](x)
+                    residual = self.resblocks[i * self.num_kernels + j](x)
+                    p = (xs.shape[1] - residual.shape[1]) // 2
+                    xs = xs[:, p:-p, :] + residual
             x = xs / self.num_kernels
 
         # 0.01 is pytorch leaky value slope,
@@ -253,6 +291,9 @@ class Generator(pax.Module):
         x = self.conv_post(x)
         x = jnp.tanh(x)
         x = jnp.squeeze(x, axis=-1)
+        if remove_output_padding:
+            p = self.compute_padding_values()[-1]
+            x = x[:, p:-p]
         return x
 
 

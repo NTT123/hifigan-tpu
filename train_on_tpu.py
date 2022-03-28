@@ -185,7 +185,7 @@ def load_npz_files(data_dir, test_size=10, split="train"):
         return files[:test_size]
 
 
-def load_data(data_dir, config, devices, spu):
+def load_data(data_dir, config, devices, spu, pad):
     """return data iter"""
     files = load_npz_files(data_dir, split="train")
     batch = []
@@ -199,10 +199,11 @@ def load_data(data_dir, config, devices, spu):
             else:
                 dic = np.load(f)
                 mel, y = dic["mel"], dic["y"]
+                mel = np.pad(mel, [(pad, pad), (0, 0)], mode="reflect")
                 cache[f] = mel, y
             num_frame = config.segment_size // config.hop_size
-            start_frame = random.randint(0, mel.shape[0] - 1 - num_frame)
-            end_frame = start_frame + num_frame
+            start_frame = random.randint(0, mel.shape[0] - 1 - num_frame - pad * 2)
+            end_frame = start_frame + num_frame + pad * 2
             mel = mel[start_frame:end_frame]
             start_idx = start_frame * config.hop_size
             end_idx = start_idx + config.segment_size
@@ -255,6 +256,14 @@ def load_ckpt(ckpt_dir, nets, optims):
     return step, nets, optims
 
 
+@jax.jit
+def fast_gen(generator, cond):
+    """generate with padded input"""
+    p = generator.compute_padding_values()[0]
+    cond = jnp.pad(cond, [(0, 0), (p, p), (0, 0)], mode="reflect")
+    return generator(cond)
+
+
 def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
     """train model...
 
@@ -291,6 +300,7 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
     optim_d = optim.init((critics.parameters()))
 
     nets = (generator, critics, mel_filter)
+    input_pad = nets[0].compute_padding_values()[0]
     optims = (optim_d, optim_g)
 
     Path(CONFIG.ckpt_dir).mkdir(exist_ok=True, parents=True)
@@ -304,9 +314,13 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
     with summary_writer.as_default(step=step):
         for f in test_files:
             dic = np.load(f)
-            tf.summary.audio(f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate)
+            tf.summary.audio(
+                f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate
+            )
 
-    for batch in double_buffer(load_data(data_dir, CONFIG, devices, spu), devices):
+    for batch in double_buffer(
+        load_data(data_dir, CONFIG, devices, spu, input_pad), devices
+    ):
         nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
         if step % 50 == 0:
@@ -335,7 +349,8 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
                 g = jax.device_put(g, device=jax.devices("cpu")[0])
                 for path in test_files:
                     dic = np.load(path)
-                    yhat = g(dic["mel"][None].astype(jnp.float32))
+                    yhat = fast_gen(g, dic["mel"][None].astype(jnp.float32))
+                    yhat = jax.device_get(yhat)
                     tf.summary.audio(
                         f"gen/{path.stem}",
                         yhat[:, :, None],
