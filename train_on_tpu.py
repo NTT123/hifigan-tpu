@@ -264,7 +264,14 @@ def fast_gen(generator, cond):
     return generator(cond)
 
 
-def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
+def train(
+    data_dir: str,
+    log_dir: str = "logs",
+    spu: int = 40,
+    log_freq=100,
+    gen_freq=10_000,
+    ckpt_freq=10_000,
+):
     """train model...
 
     Arguments:
@@ -323,7 +330,7 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
     ):
         nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
-        if step % 50 == 0:
+        if step % log_freq == 0:
             end = time.perf_counter()
             dur = end - start
             start = end
@@ -343,7 +350,7 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
                 tf.summary.scalar("critic_loss", d_loss[0])
                 tf.summary.scalar("duration", dur)
 
-        if step % 1000 == 0:
+        if step % gen_freq == 0:
             with summary_writer.as_default(step=step):
                 g = jax.tree_map(lambda x: x[0], nets[0].eval())
                 g = jax.device_put(g, device=jax.devices("cpu")[0])
@@ -357,7 +364,7 @@ def train(data_dir: str, log_dir: str = "logs", spu: int = 40):
                         CONFIG.sample_rate,
                     )
 
-        if step % 10_000 == 0:
+        if step % ckpt_freq == 0:
             nets_, optims_ = jax.device_get(
                 jax.tree_map(lambda x: x[0], (nets, optims))
             )
