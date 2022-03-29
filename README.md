@@ -7,13 +7,11 @@ Train HiFi-GAN on TPU and other fixes.
 
 This repo tried different things to improve the official implementation:
 
-1. It uses JAX library so you can your GAN vocoder on TPUs. It can run on Google Colab TPUv2 with a similar speed to a V100 GPU. It can run x3 faster (than a V100) on a TPUv3 (tested on Kaggle TPU).
+1. It uses JAX library so you can train your GAN vocoder on TPUs. It can run on Google Colab TPUv2 with a similar speed to a V100 GPU. It can run x3 faster (than a V100) on a TPUv3 (tested on Kaggle TPU).
 
-2. Even though the HiFi-GAN paper claims that its generator is a fully convolutional neural network (FCN). However, its official implementation uses padding at conv layers to keep the dimension the same. So it is not a FCN. This repo provides a FCN generator which leads to an improvement in the mel-spectrogram loss.
+2. Even though the HiFi-GAN paper claims that its generator is a fully convolutional neural network (FCN), its official implementation uses padding at conv layers to keep the dimension the same. So it is not a FCN. This repo provides a FCN generator which leads to an improvement in the mel-spectrogram loss.
 
-3. There is a discrepancy in how the target mel-spectrogram and the synthesized mel-spectrogram are computed. The target mel-spectrogram is computed from the whole audio clip, while the synthesized mel-spectrogram is computed from a fixed-size segment. This leads to differences at edged frames due to different paddings. This repo computes the target mel-spectrogram from the target audio segment on the fly, therefore, getting rid of the discrepancy. This also leads to an improvement in the mel-spectrogram loss.
-
-4. In this repo, the learning rate is reduced by a factor of 0.999 for every 1000 steps. This is different from the original implementation which reduces the learning rate for every epoch. For a small dataset, this can cause the learning rate to be reduced too fast.
+3. In this repo, the learning rate is reduced by a factor of 0.999 for every 1000 steps. This is different from the original implementation which reduces the learning rate for every epoch. For a small dataset, this can cause the learning rate to be reduced too fast.
 
 
 ## Instructions
