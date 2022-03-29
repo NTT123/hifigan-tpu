@@ -1,4 +1,7 @@
-"""GPU training script"""
+"""TPU training script"""
+import datetime
+import math
+import os
 import pickle
 import random
 import time
@@ -7,9 +10,11 @@ from pathlib import Path
 import fire
 import jax
 import jax.numpy as jnp
+import jax.tools.colab_tpu
 import numpy as np
 import opax
 import pax
+import tensorflow as tf
 
 import config as CONFIG
 from dsp import MelFilter
@@ -78,6 +83,7 @@ def update_critic(nets, optims, inputs):
     (loss_disc_all, nets), grads = pax.value_and_grad(critic_loss_fn, has_aux=True)(
         nets, inputs
     )
+    grads = jax.lax.pmean(grads, axis_name="i")
     nets, optims = opax.apply_gradients(nets, optims, grads)
     return nets, optims, loss_disc_all
 
@@ -110,10 +116,21 @@ def loss_fn(generator, inputs):
     return loss_gen_all, (generator, critics, optim_d, (loss_mel, loss_disc_all))
 
 
-@jax.jit
-def update_fn(nets, optims, inputs):
+def one_update_step(nets_optims, inputs):
     """update nets"""
+    nets, optims = nets_optims
     generator, critics, mel_filter = nets
+    cond, y = inputs
+    if cond is None:
+        cond = mel_filter(y)
+        p = (mel_filter.n_fft - mel_filter.hop_length) // 2
+        bad_frames = int(math.ceil(p / mel_filter.hop_length))
+        cond = cond[:, bad_frames:-bad_frames, :]
+        pad_frames = generator.compute_padding_values()[0]
+        p = mel_filter.hop_length * (pad_frames + bad_frames)
+        y = y[:, p:-p]
+    mel = mel_filter(y)
+    inputs = cond, y, mel
     optim_d, optim_g = optims
     vag = pax.value_and_grad(loss_fn, has_aux=True)
     (
@@ -121,12 +138,21 @@ def update_fn(nets, optims, inputs):
         (generator, critics, optim_d, (loss_mel, loss_disc_all)),
     ), grads = vag(generator, (inputs, critics, optim_d, mel_filter))
 
+    grads = jax.lax.pmean(grads, axis_name="i")
+
     generator, optim_g = opax.apply_gradients(generator, optim_g, grads)
-    return (
-        (generator, critics, mel_filter),
-        (optim_d, optim_g),
-        (loss_gen_all, loss_mel, loss_disc_all),
-    )
+    nets = (generator, critics, mel_filter)
+    optims = (optim_d, optim_g)
+    losses = (loss_gen_all, loss_mel, loss_disc_all)
+    return (nets, optims), losses
+
+
+def update_fn(nets, optims, inputs):
+    """update fn"""
+    inputs = jax.tree_map(lambda x: x.astype(jnp.float32), inputs)
+    (nets, optims), losses = pax.scan(one_update_step, (nets, optims), inputs)
+    losses = jax.tree_map(lambda x: x[-1], losses)
+    return nets, optims, losses
 
 
 def get_num_batch(data_dir, batch_size):
@@ -134,35 +160,110 @@ def get_num_batch(data_dir, batch_size):
     return len(files) // batch_size
 
 
-def load_data(data_dir, config):
-    """return data iter"""
+def _device_put_sharded(sharded_tree, devices):
+    leaves, treedef = jax.tree_flatten(sharded_tree)
+    n = leaves[0].shape[0]
+    return jax.device_put_sharded(
+        [jax.tree_unflatten(treedef, [l[i] for l in leaves]) for i in range(n)], devices
+    )
+
+
+def double_buffer(ds, devices):
+    """
+    create a double buffer iterator
+    """
+    batch = None
+    for next_batch in ds:
+        assert next_batch is not None
+        next_batch = _device_put_sharded(next_batch, devices)
+        if batch is not None:
+            yield batch
+        batch = next_batch
+    if batch is not None:
+        yield batch
+
+
+def load_npz_files(data_dir, test_size=10, split="train"):
+    """return list of npz file in a directory"""
     files = sorted(Path(data_dir).glob("*.npz"))
     assert len(files) > 0, "Empty data directory"
+    assert len(files) > test_size, "Empty test data size"
+    if split == train:
+        return files[test_size:]
+    else:
+        return files[:test_size]
+
+
+def load_data(data_dir, config, devices, spu, pad):
+    """return data iter"""
+    files = load_npz_files(data_dir, split="train")
     batch = []
-    random.shuffle(files)
-    for f in files:
-        dic = np.load(f)
-        mel, y = dic["mel"], dic["y"]
-        num_frame = config.segment_size // config.hop_size
-        start_frame = random.randint(0, mel.shape[0] - 1 - num_frame)
-        end_frame = start_frame + num_frame
-        mel = mel[start_frame:end_frame]
-        start_idx = start_frame * config.hop_size
-        end_idx = start_idx + config.segment_size
-        y = y[start_idx:end_idx]
-        batch.append((mel, y))
-        if len(batch) == config.batch_size:
-            mel, y = zip(*batch)
-            mel = np.array(mel).astype(np.float32)
-            y = np.array(y)
-            yield mel, y, mel
-            batch = []
+    cache = {}
+
+    num_frame = config.segment_size // config.hop_size
+    p = (config.n_fft - config.hop_size) // 2
+    # bad frames are frames that included padded values
+    bad_frames = int(math.ceil(p / config.hop_size))
+
+    while True:
+        random.shuffle(files)
+        num_devices = len(devices)
+        for f in files:
+            if f in cache:
+                mel, y = cache[f]
+            else:
+                dic = np.load(f)
+                y = dic["y"]
+                mel = dic["mel"] if "mel" in dic else None
+
+                # if the clip is too short, pad it with zeros
+                p = config.segment_size + bad_frames * 2 * config.hop_size - len(y)
+                if p > 0 and mel is None:
+                    y = np.pad(y, [(0, p)], mode="constant")
+
+                if mel is None:
+                    # pad the input to create "padding" input frames
+                    # for the FCN generator
+                    p = config.hop_size * pad
+                    y = np.pad(y, [(p, p)], mode="reflect")
+                else:
+                    mel = np.pad(mel, [(pad, pad), (0, 0)], mode="reflect")
+                cache[f] = mel, y
+
+            if mel is not None:
+                # for text-to-speech task
+                start_frame = random.randint(0, mel.shape[0] - 1 - num_frame - pad * 2)
+                end_frame = start_frame + num_frame + pad * 2
+                mel = mel[start_frame:end_frame]
+                start_idx = start_frame * config.hop_size
+                end_idx = start_idx + config.segment_size
+                y = y[start_idx:end_idx]
+                batch.append((mel, y))
+            else:
+                # for normal training
+                L = config.segment_size + 2 * (pad + bad_frames) * config.hop_size
+                start_idx = random.randint(0, len(y) - L)
+                end_idx = start_idx + L
+                y = y[start_idx:end_idx]
+                batch.append((None, y))
+
+            if len(batch) == config.batch_size * spu:
+                mel, y = zip(*batch)
+                if mel[0] is not None:
+                    mel = np.array(mel).astype(np.float32)
+                    mel = mel.reshape((num_devices, spu, -1, *mel.shape[1:]))
+                else:
+                    mel = None
+                y = np.array(y).astype(np.float32)
+                y = y.reshape((num_devices, spu, -1, *y.shape[1:]))
+                yield mel, y
+                batch = []
 
 
 def save_ckpt(ckpt_dir, step, nets, optims):
     """save checkpoint to disk"""
-    (generator, critics, mel_filter) = jax.device_get(nets)
-    (optim_d, optim_g) = jax.device_get(optims)
+    (generator, critics, _) = nets
+    (optim_d, optim_g) = optims
     dic = {
         "step": step,
         "generator": generator.state_dict(),
@@ -172,7 +273,7 @@ def save_ckpt(ckpt_dir, step, nets, optims):
     }
     file = ckpt_dir / f"hifigan_{step:07d}.ckpt"
     with open(file, "wb") as f:
-        pickle.dump(f, dic)
+        pickle.dump(dic, f)
 
 
 def load_ckpt(ckpt_dir, nets, optims):
@@ -196,10 +297,42 @@ def load_ckpt(ckpt_dir, nets, optims):
     return step, nets, optims
 
 
-def train(data_dir):
-    """train model..."""
+@jax.jit
+def fast_gen(generator, cond):
+    """generate with padded input"""
+    p = generator.compute_padding_values()[0]
+    cond = jnp.pad(cond, [(0, 0), (p, p), (0, 0)], mode="reflect")
+    return generator(cond)
+
+
+def train(
+    data_dir: str,
+    log_dir: str = "logs",
+    spu: int = 40,
+    log_freq=100,
+    gen_freq=10_000,
+    ckpt_freq=10_000,
+):
+    """train model...
+
+    Arguments:
+        data_dir: path to data directory
+        spu: number of update steps per pmap update call
+    """
+
+    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    summary_writer = tf.summary.create_file_writer(str(Path(log_dir) / current_time))
+
+    # TPU setup
+    if "COLAB_TPU_ADDR" in os.environ:
+        jax.tools.colab_tpu.setup_tpu()
+
     generator, critics, mel_filter = create_model(CONFIG)
-    print(f"Data set size: {get_num_batch(data_dir, CONFIG.batch_size)} batches")
+    num_batch = get_num_batch(data_dir, CONFIG.batch_size)
+    print(f"Data set size: {num_batch} batches")
+    num_devices = jax.device_count()
+    devices = jax.devices()
+    print(f"{num_devices} devices: {devices}")
 
     def exp_decay(step):
         num_epoch = jnp.floor(step / 1000)
@@ -215,28 +348,70 @@ def train(data_dir):
     optim_d = optim.init((critics.parameters()))
 
     nets = (generator, critics, mel_filter)
+    input_pad = nets[0].compute_padding_values()[0]
     optims = (optim_d, optim_g)
 
     Path(CONFIG.ckpt_dir).mkdir(exist_ok=True, parents=True)
-    step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    last_step, nets, optims = load_ckpt(CONFIG.ckpt_dir, nets, optims)
+    nets, optims = jax.device_put_replicated((nets, optims), devices)
     start = time.perf_counter()
+    pmap_update_fn = jax.pmap(update_fn, axis_name="i", devices=devices)
+    test_files = load_npz_files(data_dir, split="test")
+    step = 0 if last_step == -1 else (last_step + spu)
+    # log all ground-truth test audio clips
+    with summary_writer.as_default(step=step):
+        for f in test_files:
+            dic = np.load(f)
+            tf.summary.audio(
+                f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate
+            )
 
-    for epoch in range(10000):
-        for batch in load_data(data_dir, CONFIG):
-            step += 1
-            nets, optims, (g_loss, mel_loss, d_loss) = update_fn(nets, optims, batch)
+    for batch in double_buffer(
+        load_data(data_dir, CONFIG, devices, spu, input_pad), devices
+    ):
+        nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
+        if step % log_freq == 0:
             end = time.perf_counter()
             dur = end - start
             start = end
-            if step % 5 == 0:
-                print(
-                    f"step {step:07d}  epoch {epoch:05d}  gen loss {g_loss:.3f}"
-                    f"  mel loss {mel_loss:.3f}  critic loss {d_loss:.3f}  {dur:.2f}s"
-                )
+            epoch = step // num_batch
+            lr = optims[0][-1].learning_rate[0]
+            print(
+                f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss[0]:.3f}"
+                f"  mel loss {mel_loss[0]:.3f}  critic loss {d_loss[0]:.3f}  {dur:.2f}s"
+            )
 
-        if epoch % 10 == 0:
-            save_ckpt(Path(CONFIG.ckpt_dir), step, nets, optims)
+            with summary_writer.as_default(step=step):
+                tf.summary.scalar("step", step)
+                tf.summary.scalar("epoch", epoch)
+                tf.summary.scalar("lr", lr)
+                tf.summary.scalar("gen_loss", g_loss[0])
+                tf.summary.scalar("mel_loss", mel_loss[0])
+                tf.summary.scalar("critic_loss", d_loss[0])
+                tf.summary.scalar("duration", dur)
+
+        if step % gen_freq == 0:
+            with summary_writer.as_default(step=step):
+                g = jax.tree_map(lambda x: x[0], nets[0].eval())
+                g = jax.device_put(g, device=jax.devices("cpu")[0])
+                for path in test_files:
+                    dic = np.load(path)
+                    yhat = fast_gen(g, dic["mel"][None].astype(jnp.float32))
+                    yhat = jax.device_get(yhat)
+                    tf.summary.audio(
+                        f"gen/{path.stem}",
+                        yhat[:, :, None],
+                        CONFIG.sample_rate,
+                    )
+
+        if step % ckpt_freq == 0:
+            nets_, optims_ = jax.device_get(
+                jax.tree_map(lambda x: x[0], (nets, optims))
+            )
+            save_ckpt(Path(CONFIG.ckpt_dir), step, nets_, optims_)
+
+        step += spu
 
 
 if __name__ == "__main__":
