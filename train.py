@@ -327,6 +327,9 @@ def train(
         jax.tools.colab_tpu.setup_tpu()
 
     generator, critics, mel_filter = create_model(CONFIG)
+    cpu_device = jax.devices("cpu")[0]
+    cpu_mel_filter = jax.jit(jax.device_put(mel_filter, cpu_device))
+
     num_batch = get_num_batch(data_dir, CONFIG.batch_size)
     print(f"Data set size: {num_batch} batches")
     num_devices = jax.device_count()
@@ -376,27 +379,37 @@ def train(
             start = end
             epoch = step // num_batch
             lr = optims[0][-1].learning_rate[0]
+            g_loss, mel_loss, d_loss = jax.device_get(
+                (g_loss[0], mel_loss[0], d_loss[0])
+            )
             print(
-                f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss[0]:.3f}"
-                f"  mel loss {mel_loss[0]:.3f}  critic loss {d_loss[0]:.3f}  {dur:.2f}s"
+                f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss:.3f}"
+                f"  mel loss {mel_loss:.3f}  critic loss {d_loss:.3f}  {dur:.2f}s"
             )
 
             with summary_writer.as_default(step=step):
                 tf.summary.scalar("step", step)
                 tf.summary.scalar("epoch", epoch)
                 tf.summary.scalar("lr", lr)
-                tf.summary.scalar("gen_loss", g_loss[0])
-                tf.summary.scalar("mel_loss", mel_loss[0])
-                tf.summary.scalar("critic_loss", d_loss[0])
+                tf.summary.scalar("gen_loss", g_loss)
+                tf.summary.scalar("mel_loss", mel_loss)
+                tf.summary.scalar("critic_loss", d_loss)
                 tf.summary.scalar("duration", dur)
 
         if step % gen_freq == 0:
             with summary_writer.as_default(step=step):
                 g = jax.tree_map(lambda x: x[0], nets[0].eval())
-                g = jax.device_put(g, device=jax.devices("cpu")[0])
+                g = jax.device_put(g, device=cpu_device)
                 for path in test_files:
                     dic = np.load(path)
-                    yhat = fast_gen(g, dic["mel"][None].astype(jnp.float32))
+                    if "mel" in dic:
+                        mel = dic["mel"][None].astype(jnp.float32)
+                        mel = jax.device_put(mel, cpu_device)
+                    else:
+                        y = jax.device_put(dic["y"][None], cpu_device)
+                        mel = cpu_mel_filter(y)
+
+                    yhat = fast_gen(g, mel)
                     yhat = jax.device_get(yhat)
                     tf.summary.audio(
                         f"gen/{path.stem}",
