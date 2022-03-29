@@ -13,6 +13,10 @@ This repo tried different things to improve the official implementation:
 
 3. In this repo, the learning rate is reduced by a factor of 0.999 for every 1000 steps. This is different from the original implementation which reduces the learning rate for every epoch. For a small dataset, this can cause the learning rate to be reduced too fast.
 
+4. The original implementation computes conditional mel-spectrogram frames on the fly for each target audio segment.
+This creates biased frames at the edges due to padding.
+In this repo, we also compute conditional frames on the fly, however, we remove biased frames at the edges.
+
 
 ## Instructions
 
