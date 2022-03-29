@@ -183,20 +183,21 @@ def double_buffer(ds, devices):
         yield batch
 
 
-def load_npz_files(data_dir, test_size=10, split="train"):
+def load_npz_files(data_dir, test_size=200, split="train"):
     """return list of npz file in a directory"""
     files = sorted(Path(data_dir).glob("*.npz"))
+    random.Random(42).shuffle(files)
     assert len(files) > 0, "Empty data directory"
     assert len(files) > test_size, "Empty test data size"
-    if split == train:
+    if split == "train":
         return files[test_size:]
     else:
         return files[:test_size]
 
 
-def load_data(data_dir, config, devices, spu, pad):
+def load_data(data_dir, config, devices, spu, pad, split="train"):
     """return data iter"""
-    files = load_npz_files(data_dir, split="train")
+    files = load_npz_files(data_dir, split=split)
     batch = []
     cache = {}
 
@@ -362,29 +363,40 @@ def train(
     step = 0 if last_step == -1 else (last_step + spu)
     # log all ground-truth test audio clips
     with summary_writer.as_default(step=step):
-        for f in test_files:
+        for f in test_files[:10]:
             dic = np.load(f)
             tf.summary.audio(
                 f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate
             )
 
-    for batch in double_buffer(
-        load_data(data_dir, CONFIG, devices, spu, input_pad), devices
-    ):
+    test_data_iter = double_buffer(
+        load_data(data_dir, CONFIG, devices, spu, input_pad, "test"), devices
+    )
+    train_data_iter = double_buffer(
+        load_data(data_dir, CONFIG, devices, spu, input_pad, "train"), devices
+    )
+
+    while True:
+        batch = next(train_data_iter)
         nets, optims, (g_loss, mel_loss, d_loss) = pmap_update_fn(nets, optims, batch)
 
         if step % log_freq == 0:
+            batch = next(test_data_iter)
+            _, _, (_, mel_loss, _) = pmap_update_fn(nets, optims, batch)
+            test_mel_loss = jnp.mean(mel_loss)
+
             end = time.perf_counter()
             dur = end - start
             start = end
             epoch = step // num_batch
             lr = optims[0][-1].learning_rate[0]
-            g_loss, mel_loss, d_loss = jax.device_get(
-                (g_loss[0], mel_loss[0], d_loss[0])
+            g_loss, mel_loss, d_loss, test_mel_loss = jax.device_get(
+                (g_loss[0], mel_loss[0], d_loss[0], test_mel_loss)
             )
             print(
                 f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss:.3f}"
-                f"  mel loss {mel_loss:.3f}  critic loss {d_loss:.3f}  {dur:.2f}s"
+                f"  mel loss {mel_loss:.3f}  test mel loss {test_mel_loss:.3f}"
+                f"  critic loss {d_loss:.3f}  {dur:.2f}s"
             )
 
             with summary_writer.as_default(step=step):
@@ -395,12 +407,13 @@ def train(
                 tf.summary.scalar("mel_loss", mel_loss)
                 tf.summary.scalar("critic_loss", d_loss)
                 tf.summary.scalar("duration", dur)
+                tf.summary.scalar("test_mel_loss", test_mel_loss)
 
         if step % gen_freq == 0:
             with summary_writer.as_default(step=step):
                 g = jax.tree_map(lambda x: x[0], nets[0].eval())
                 g = jax.device_put(g, device=cpu_device)
-                for path in test_files:
+                for path in test_files[:10]:
                     dic = np.load(path)
                     if "mel" in dic:
                         mel = dic["mel"][None].astype(jnp.float32)
