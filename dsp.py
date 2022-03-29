@@ -58,9 +58,8 @@ def batched_stft(
     y_frames = rolling_window(y, n_fft, hop_length)
     fft_window = jnp.reshape(fft_window, (-1,) + (1,) * (len(y.shape)))
     y_frames = y_frames * fft_window
-    stft_matrix = jnp.fft.fft(y_frames, axis=0)
-    d = int(1 + n_fft // 2)
-    return stft_matrix[:d]
+    stft_matrix = jnp.fft.rfft(y_frames, axis=0)
+    return stft_matrix
 
 
 class MelFilter(pax.Module):
