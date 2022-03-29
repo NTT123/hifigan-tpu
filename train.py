@@ -217,14 +217,13 @@ def load_data(data_dir, config, devices, spu, pad):
                 mel = dic["mel"] if "mel" in dic else None
 
                 # if the clip is too short, pad it with zeros
-                p = config.segment_size + bad_frames * 2 * config.hop_size - len(y)
+                p = config.segment_size - len(y)
                 if p > 0 and mel is None:
                     y = np.pad(y, [(0, p)], mode="constant")
 
                 if mel is None:
-                    # pad the input to create "padding" input frames
-                    # for the FCN generator
-                    p = config.hop_size * pad
+                    # pad the input to create "padding" input frames for the FCN generator
+                    p = config.hop_size * (pad + bad_frames)
                     y = np.pad(y, [(p, p)], mode="reflect")
                 else:
                     mel = np.pad(mel, [(pad, pad), (0, 0)], mode="reflect")
