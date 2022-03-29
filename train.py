@@ -369,12 +369,10 @@ def train(
                 f"gt/{f.stem}", dic["y"][None, :, None], CONFIG.sample_rate
             )
 
-    test_data_iter = double_buffer(
-        load_data(data_dir, CONFIG, devices, spu, input_pad, "test"), devices
-    )
-    train_data_iter = double_buffer(
-        load_data(data_dir, CONFIG, devices, spu, input_pad, "train"), devices
-    )
+    test_data_iter = load_data(data_dir, CONFIG, devices, spu, input_pad, "test")
+    test_data_iter = double_buffer(test_data_iter, devices)
+    train_data_iter = load_data(data_dir, CONFIG, devices, spu, input_pad, "train")
+    train_data_iter = double_buffer(train_data_iter, devices)
 
     while True:
         batch = next(train_data_iter)
