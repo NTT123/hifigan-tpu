@@ -383,16 +383,15 @@ def train(
         if step % log_freq == 0:
             batch = next(test_data_iter)
             _, _, (_, mel_loss, _) = pmap_update_fn(nets, optims, batch)
-            test_mel_loss = jnp.mean(mel_loss)
+            losses = (g_loss, d_loss, mel_loss, test_mel_loss)
+            losses = jax.device_get(jax.tree_map(jnp.mean, losses))
+            g_loss, d_loss, mel_loss, test_mel_loss = losses
 
             end = time.perf_counter()
             dur = end - start
             start = end
             epoch = step // num_batch
             lr = optims[0][-1].learning_rate[0]
-            g_loss, mel_loss, d_loss, test_mel_loss = jax.device_get(
-                (g_loss[0], mel_loss[0], d_loss[0], test_mel_loss)
-            )
             print(
                 f"step {step:07d}  epoch {epoch:05d}  lr {lr:.2e}  gen loss {g_loss:.3f}"
                 f"  mel loss {mel_loss:.3f}  test mel loss {test_mel_loss:.3f}"
