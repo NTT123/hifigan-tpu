@@ -382,7 +382,7 @@ def train(
 
         if step % log_freq == 0:
             batch = next(test_data_iter)
-            _, _, (_, mel_loss, _) = pmap_update_fn(nets, optims, batch)
+            _, _, (_, test_mel_loss, _) = pmap_update_fn(nets, optims, batch)
             losses = (g_loss, d_loss, mel_loss, test_mel_loss)
             losses = jax.device_get(jax.tree_map(jnp.mean, losses))
             g_loss, d_loss, mel_loss, test_mel_loss = losses
