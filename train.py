@@ -156,7 +156,7 @@ def update_fn(nets, optims, inputs):
 
 
 def get_num_batch(data_dir, batch_size):
-    files = sorted(Path(data_dir).glob("*.npz"))
+    files = sorted(Path(data_dir).glob("**/*.npz"))
     return len(files) // batch_size
 
 
