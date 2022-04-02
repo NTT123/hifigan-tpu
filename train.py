@@ -185,7 +185,7 @@ def double_buffer(ds, devices):
 
 def load_npz_files(data_dir, test_size=200, split="train"):
     """return list of npz file in a directory"""
-    files = sorted(Path(data_dir).glob("*.npz"))
+    files = sorted(Path(data_dir).glob("**/*.npz"))
     random.Random(42).shuffle(files)
     assert len(files) > 0, "Empty data directory"
     assert len(files) > test_size, "Empty test data size"

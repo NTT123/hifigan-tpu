@@ -17,7 +17,7 @@ parser.add_argument("--wav-dir", type=Path, required=True)
 
 args = parser.parse_args()
 
-wav_files = sorted(args.wav_dir.glob("*.wav"), key=os.path.getsize)
+wav_files = sorted(args.wav_dir.glob("**/*.wav"))
 random.Random(42).shuffle(wav_files)
 data = []
 for path in tqdm(wav_files):
