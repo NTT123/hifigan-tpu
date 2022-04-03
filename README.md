@@ -1,6 +1,8 @@
 # hifigan-tpu
 Train HiFi-GAN on TPU and other fixes.
 
+This branch is used to compare the result with the original HiFi-GAN implementation.
+
 ## Introduction
 
 [HiFi-GAN](https://arxiv.org/abs/2010.05646) is a popular GAN vocoder that achieves very good audio quality and real-time speech generation on CPU. The official HiFi-GAN implementation is at https://github.com/jik876/hifi-gan
@@ -23,6 +25,7 @@ In this repo, we also compute conditional frames on the fly, however, we remove 
 ```sh
 pip3 install -r requirements.txt
 python3 ljs.py
-python3 prepare_data.py --wav-dir=/path/to/wav/dir
-python3 train.py --data-dir=/path/to/wav/dir
+ln -sT /path/to/wavs/dir LJSpeech-1.1/wavs
+python3 prepare_data.py --wav-dir=LJSpeech-1.1/wavs
+python3 train.py
 ```

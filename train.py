@@ -113,7 +113,7 @@ def loss_fn(generator, inputs):
     loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
     loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
 
-    return loss_gen_all, (generator, critics, optim_d, (loss_mel, loss_disc_all))
+    return loss_gen_all, (generator, critics, optim_d, (loss_mel / 45, loss_disc_all))
 
 
 def one_update_step(nets_optims, inputs):
@@ -156,8 +156,10 @@ def update_fn(nets, optims, inputs):
 
 
 def get_num_batch(data_dir, batch_size):
-    files = sorted(Path(data_dir).glob("*.npz"))
-    return len(files) // batch_size
+    """return number of training batches."""
+    f = open(Path(data_dir) / "training.txt", "r", encoding="utf-8")
+    lines = f.readlines()
+    return len(lines) // batch_size
 
 
 def _device_put_sharded(sharded_tree, devices):
@@ -183,16 +185,20 @@ def double_buffer(ds, devices):
         yield batch
 
 
-def load_npz_files(data_dir, test_size=200, split="train"):
-    """return list of npz file in a directory"""
-    files = sorted(Path(data_dir).glob("*.npz"))
-    random.Random(42).shuffle(files)
-    assert len(files) > 0, "Empty data directory"
-    assert len(files) > test_size, "Empty test data size"
+def load_npz_files(data_dir, split="train"):
+    """return list of npz file in the dataset"""
+    data_dir = Path(data_dir)
     if split == "train":
-        return files[test_size:]
+        meta_file = data_dir / "training.txt"
     else:
-        return files[:test_size]
+        meta_file = data_dir / "validation.txt"
+    lines = open(meta_file, "r", encoding="utf-8").readlines()
+    files = []
+    for line in lines:
+        ident = line.strip().split("|")[0]
+        files.append(data_dir / "wavs" / f"{ident}.npz")
+    return files
+
 
 
 def load_data(data_dir, config, devices, spu, pad, split="train"):
@@ -306,7 +312,7 @@ def fast_gen(generator, cond):
 
 
 def train(
-    data_dir: str,
+    data_dir: str = "LJSpeech-1.1",
     log_dir: str = "logs",
     spu: int = 40,
     log_freq=100,
@@ -338,7 +344,7 @@ def train(
     print(f"{num_devices} devices: {devices}")
 
     def exp_decay(step):
-        num_epoch = jnp.floor(step / 1000)
+        num_epoch = jnp.floor(step / num_batch)
         scale = jnp.power(CONFIG.lr_decay, num_epoch)
         return scale * CONFIG.learning_rate
 

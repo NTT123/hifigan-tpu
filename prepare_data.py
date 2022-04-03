@@ -8,6 +8,7 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+from librosa.util import normalize
 from tqdm.cli import tqdm
 
 import config as CONFIG
@@ -22,6 +23,7 @@ random.Random(42).shuffle(wav_files)
 data = []
 for path in tqdm(wav_files):
     y, sr = librosa.load(path, sr=CONFIG.sample_rate)
+    y = normalize(y) * 0.95
     assert sr == CONFIG.sample_rate
     fn = path.with_suffix(".npz")
     np.savez(fn, y=y)

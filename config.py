@@ -1,6 +1,6 @@
 version = "v1"
 resblock_kind = "1"
-batch_size = 32
+batch_size = 16
 learning_rate = 0.0002
 adam_b1 = 0.8
 adam_b2 = 0.99
